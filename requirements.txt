@@ -1,0 +1,15 @@
+fastapi
+uvicorn[standard]
+pandas
+pyarrow
+boto3
+s3fs
+python-dotenv
+pydantic-settings
+python-multipart
+rapidfuzz
+statsmodels
+scikit-learn
+xgboost
+mcp
+fastmcp
