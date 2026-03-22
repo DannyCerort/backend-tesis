@@ -194,15 +194,41 @@ def build_silver() -> dict:
         raise FileNotFoundError(f"No existe bronze en s3://{bucket}/{bronze_key}")
 
     s3 = get_s3_client()
-
     response = s3.get_object(Bucket=bucket, Key=bronze_key)
     parquet_bytes = response["Body"].read()
 
     df = pd.read_parquet(io.BytesIO(parquet_bytes), engine="pyarrow")
-
     total_inicial = len(df)
 
-    # Ajustes iniciales
+    # -------------------------------------------------------------------
+    # 🔁 Normalizar columnas numéricas con coma decimal
+    # -------------------------------------------------------------------
+    numeric_cols = [
+        "VAL TOTAL",
+        "VALOR NETO",
+        "VALOR CON IVA",
+        "IVA",
+        "RETENCION  ICA",
+        "RETEFUENTE",
+        "% ICA",
+        "por_iva",
+        "%RETENCION",
+    ]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = (
+                df[col]
+                .astype(str)
+                .str.replace(".", "", regex=False)   # quitar separadores de miles
+                .str.replace(",", ".", regex=False)  # convertir coma en punto decimal
+                .str.replace(" ", "", regex=False)
+                .str.replace("$", "", regex=False)
+            )
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # -------------------------------------------------------------------
+    # Continuar con la lógica existente (filtrado de 2025-10, clasificación, etc.)
+    # -------------------------------------------------------------------
     cut_year = 2025
     cut_month = 10
 
@@ -222,7 +248,6 @@ def build_silver() -> dict:
         raise ValueError(f"Faltan columnas requeridas para ETL: {missing}")
 
     df[["MES_SERVICIO", "ANIO_SERVICIO"]] = df["OBSERVACION"].apply(extraer_mes_anio)
-
     mask_etl_ok = df["MES_SERVICIO"].notna()
     df.loc[mask_etl_ok, "ANIO_SERVICIO"] = df.loc[mask_etl_ok].apply(inferir_anio_servicio, axis=1)
 
@@ -249,6 +274,8 @@ def build_silver() -> dict:
     )
 
     df_final = df_etl[mask_diff_ok].copy()
+    total_val = df_final["VAL TOTAL"].sum()
+    print(f"Suma de VAL TOTAL: {total_val:,.2f}")
 
     parquet_buffer = io.BytesIO()
     df_final.to_parquet(
