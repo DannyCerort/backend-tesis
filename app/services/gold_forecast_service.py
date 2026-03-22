@@ -16,7 +16,7 @@ from app.services.forecast_models import (
 )
 
 HORIZON = 6
-MIN_MONTHS = 18
+MIN_MONTHS = 12
 ALPHA = 0.05
 
 DATE_COL = "fecha_facturacion"
