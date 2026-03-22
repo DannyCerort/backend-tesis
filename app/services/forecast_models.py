@@ -1,45 +1,30 @@
 """
 forecast_models.py
 
-Modelos "suaves" (clásicos) + ML tabular para pronóstico univariado mensual:
-
-Clásicos:
-- Naive
-- Seasonal Naive (si estacionalidad)
-- Promedio Simple (PS)
-- Promedio Móvil (PM)
-- Suavización Exponencial Simple (SES)
-- Holt (tendencia)
-- Holt-Winters (tendencia + estacionalidad)  [solo si estacionalidad]
-- Regresión Lineal (RL)
-- ARIMA
-- SARIMA (si estacionalidad)
-
-Machine Learning (tabular con lags + calendario):
-- Random Forest Regressor
-- XGBoost Regressor (si está instalado)
+Modelos "suaves" (clásicos) + ML tabular para pronóstico univariado mensual.
 
 Incluye:
-- preparación de serie mensual
-- detección automática de estacionalidad (ACF en lag estacional)
-- evaluación walk-forward con MSE
-- selección automática del mejor modelo por MSE
-- cálculo de bandas (LL/UL) por cuantiles de residuales
-- get_fitted_and_residuals() consistente para Monte Carlo
-
-Notas:
-- En ML usamos estrategia recursiva para multi-step: predicción t+1 alimenta lags para t+2, etc.
-- Para fitted de ML, generamos one-step-ahead (walk-forward interno) para evitar leakage.
+- Modelos clásicos
+- Random Forest / XGBoost
+- Detección automática de estacionalidad
+- Walk-forward con MSE
+- Tuning tipo grilla para RF/XGB
+- Bandas por cuantiles de residuales
+- Fitted/residuales consistentes para Monte Carlo
+- Prints de avance en consola
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Callable, Optional, Tuple, List, Dict
+from itertools import product
+import warnings
 
 import numpy as np
 import pandas as pd
 
+from statsmodels.tools.sm_exceptions import ConvergenceWarning
 from statsmodels.tsa.holtwinters import SimpleExpSmoothing, Holt, ExponentialSmoothing
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 
@@ -54,13 +39,81 @@ except Exception:
 
 
 # =========================
-# FLAGS (si quieres apagar algo rápido)
+# FLAGS
 # =========================
 INCLUDE_NAIVE = True
 INCLUDE_ARIMA = True
 INCLUDE_SEASONAL_NAIVE = True
 INCLUDE_ML = True
-INCLUDE_XGBOOST = True  # requiere xgboost instalado
+INCLUDE_XGBOOST = False   # <- por estabilidad, déjalo False mientras estabilizas
+
+VERBOSE_FORECAST = True
+VERBOSE_WALK_FORWARD = False   # <- evita imprimir cada split
+VERBOSE_TUNING = True
+VERBOSE_MODEL_FIT = False
+
+
+# =========================
+# Warnings: silenciar ruido repetitivo
+# =========================
+warnings.filterwarnings("ignore", category=ConvergenceWarning)
+warnings.filterwarnings(
+    "ignore",
+    message="Too few observations to estimate starting parameters",
+)
+warnings.filterwarnings(
+    "ignore",
+    message="Maximum Likelihood optimization failed to converge",
+)
+warnings.filterwarnings(
+    "ignore",
+    message="invalid value encountered in divide",
+)
+warnings.filterwarnings(
+    "ignore",
+    message="`sklearn.utils.parallel.delayed` should be used with `sklearn.utils.parallel.Parallel`",
+)
+
+
+# =========================
+# Grillas por defecto ML tuning (LIVIANAS)
+# =========================
+RF_PARAM_GRID = {
+    "n_estimators": [200, 300, 400, 500, 800],
+    "max_depth": [3, 4, 5, 6, 8, None],
+    "min_samples_leaf": [1, 2, 3, 4],
+    "max_features": ["sqrt", 0.5, 0.7, 1.0],
+    "bootstrap": [True],
+}
+
+XGB_PARAM_GRID = {
+    "n_estimators": [200, 400],
+    "learning_rate": [0.05, 0.1],
+    "max_depth": [2, 3],
+    "subsample": [0.8, 1.0],
+    "colsample_bytree": [0.8, 1.0],
+    "min_child_weight": [1],
+}
+
+
+def _vprint(msg: str):
+    if VERBOSE_FORECAST:
+        print(msg)
+
+
+def _wvprint(msg: str):
+    if VERBOSE_WALK_FORWARD:
+        print(msg)
+
+
+def _tvprint(msg: str):
+    if VERBOSE_TUNING:
+        print(msg)
+
+
+def _mvprint(msg: str):
+    if VERBOSE_MODEL_FIT:
+        print(msg)
 
 
 # =========================
@@ -82,9 +135,8 @@ def to_monthly_series(
     date_col: str,
     value_col: str,
     freq: str = "MS",
-    fill_missing: str = "zero",  # "zero" | "nan"
+    fill_missing: str = "zero",
 ) -> pd.Series:
-    """Convierte un DataFrame a serie mensual (DatetimeIndex, freq MS por defecto)."""
     tmp = df[[date_col, value_col]].copy()
     tmp[date_col] = pd.to_datetime(tmp[date_col], errors="coerce")
     tmp[value_col] = pd.to_numeric(tmp[value_col], errors="coerce")
@@ -98,7 +150,6 @@ def to_monthly_series(
 
     y = tmp.groupby("__month")[value_col].sum().sort_index()
     y.index = pd.DatetimeIndex(y.index)
-
     y = y.asfreq(freq)
 
     if fill_missing == "zero":
@@ -113,18 +164,13 @@ def check_min_length(y: pd.Series, min_len: int) -> None:
 
 
 # =========================
-# Helpers ML (lags + calendario)
+# Helpers ML
 # =========================
 def _make_supervised_features(
     y: pd.Series,
     lags: int = 12,
     add_calendar: bool = True,
 ) -> pd.DataFrame:
-    """
-    Dataset supervisado:
-      X_t = [y_{t-1},...,y_{t-lags}, (month sin/cos)]
-      y_t = y_t
-    """
     y = y.asfreq("MS").astype(float)
     df = pd.DataFrame({"y": y})
 
@@ -136,7 +182,11 @@ def _make_supervised_features(
         df["m_sin"] = np.sin(2 * np.pi * m / 12.0)
         df["m_cos"] = np.cos(2 * np.pi * m / 12.0)
 
-    return df.dropna()
+    out = df.dropna()
+    _mvprint(
+        f"[_make_supervised_features] len_y={len(y)} | lags={lags} | add_calendar={add_calendar} | rows_out={len(out)}"
+    )
+    return out
 
 
 def _recursive_forecast_ml(
@@ -146,7 +196,6 @@ def _recursive_forecast_ml(
     lags: int = 12,
     add_calendar: bool = True,
 ) -> pd.Series:
-    """Forecast multi-step recursivo con lags."""
     y_train = y_train.asfreq("MS").fillna(0.0).astype(float)
     df_sup = _make_supervised_features(y_train, lags=lags, add_calendar=add_calendar)
     if df_sup.empty:
@@ -154,6 +203,7 @@ def _recursive_forecast_ml(
 
     X = df_sup.drop(columns=["y"]).values
     y_target = df_sup["y"].values.astype(float)
+    _mvprint(f"[_recursive_forecast_ml] Entrenando {type(model).__name__} con X.shape={X.shape}")
     model.fit(X, y_target)
 
     history = y_train.values.astype(float).tolist()
@@ -161,7 +211,6 @@ def _recursive_forecast_ml(
 
     preds = []
     for dt in idx:
-        # lag_1 es el valor más reciente
         lag_vals = history[-lags:][::-1]
         if len(lag_vals) < lags:
             lag_vals = lag_vals + [0.0] * (lags - len(lag_vals))
@@ -188,15 +237,12 @@ def _one_step_ahead_fitted_ml(
     add_calendar: bool = True,
     initial_train: int = 12,
 ) -> pd.Series:
-    """
-    fitted one-step-ahead sin leakage:
-    para cada t>=start predice y_t entrenando con y_{<=t-1}
-    """
     y = y.asfreq("MS").fillna(0.0).astype(float)
     fitted = pd.Series(index=y.index, dtype=float)
 
     start = max(initial_train, lags + 1)
     if len(y) <= start:
+        _mvprint(f"[_one_step_ahead_fitted_ml] Serie muy corta para fitted ML: len={len(y)}, start={start}")
         return fitted
 
     for t in range(start, len(y)):
@@ -212,7 +258,7 @@ def _one_step_ahead_fitted_ml(
         model.fit(X, y_target)
 
         dt = y.index[t]
-        lag_vals = y.iloc[t - lags : t].values.astype(float)[::-1]  # lag_1=y_{t-1}
+        lag_vals = y.iloc[t - lags:t].values.astype(float)[::-1]
         feats = list(lag_vals)
 
         if add_calendar:
@@ -226,7 +272,7 @@ def _one_step_ahead_fitted_ml(
 
 
 # =========================
-# Detección automática de estacionalidad
+# Detección de estacionalidad
 # =========================
 def detect_seasonality_acf(
     y: pd.Series,
@@ -234,7 +280,6 @@ def detect_seasonality_acf(
     threshold: float = 0.30,
     min_cycles: int = 2,
 ) -> Dict[str, float | bool]:
-    """Detecta estacionalidad usando autocorrelación en lag = seasonal_period."""
     y = y.dropna().astype(float)
 
     enough = len(y) >= (min_cycles * seasonal_period + 1)
@@ -253,23 +298,27 @@ def detect_best_seasonality(
     threshold: float = 0.30,
     min_cycles: int = 2,
 ) -> Dict[str, float | bool | int]:
-    """Prueba varios periodos estacionales y elige el mayor |acf|."""
     best = {"is_seasonal": False, "seasonal_period": int(candidate_periods[0]), "strength": 0.0}
 
     for p in candidate_periods:
         r = detect_seasonality_acf(y, seasonal_period=p, threshold=threshold, min_cycles=min_cycles)
         if abs(float(r["strength"])) > abs(float(best["strength"])):
-            best = {"is_seasonal": bool(r["is_seasonal"]), "seasonal_period": int(p), "strength": float(r["strength"])}
+            best = {
+                "is_seasonal": bool(r["is_seasonal"]),
+                "seasonal_period": int(p),
+                "strength": float(r["strength"]),
+            }
 
     best["is_seasonal"] = bool(
         abs(float(best["strength"])) >= threshold
         and len(y.dropna()) >= (min_cycles * int(best["seasonal_period"]) + 1)
     )
+    _vprint(f"[detect_best_seasonality] best={best}")
     return best
 
 
 # =========================
-# Forecasts (Clásicos)
+# Forecasts clásicos
 # =========================
 def forecast_naive(y_train: pd.Series, h: int = 1) -> ForecastResult:
     last = float(y_train.iloc[-1])
@@ -283,7 +332,12 @@ def forecast_seasonal_naive(y_train: pd.Series, h: int = 1, season_length: int =
     idx = pd.date_range(y_train.index[-1] + pd.offsets.MonthBegin(1), periods=h, freq="MS")
     vals = [float(y_train.iloc[-season_length + (i % season_length)]) for i in range(h)]
     fitted = y_train.shift(season_length)
-    return ForecastResult("seasonal_naive", pd.Series(vals, index=idx, dtype=float), fitted=fitted, details={"season_length": season_length})
+    return ForecastResult(
+        "seasonal_naive",
+        pd.Series(vals, index=idx, dtype=float),
+        fitted=fitted,
+        details={"season_length": season_length},
+    )
 
 
 def forecast_simple_average(y_train: pd.Series, h: int = 1) -> ForecastResult:
@@ -362,7 +416,7 @@ def forecast_linear_regression(y_train: pd.Series, h: int = 1) -> ForecastResult
     check_min_length(y_train, 3)
 
     t = np.arange(1, n + 1, dtype=float)
-    b, a = np.polyfit(t, yv, deg=1)  # y = b t + a
+    b, a = np.polyfit(t, yv, deg=1)
 
     fitted = pd.Series(a + b * t, index=y_train.index, dtype=float)
 
@@ -411,7 +465,7 @@ def forecast_sarima(
 
 
 # =========================
-# Forecasts (ML)
+# Forecasts ML
 # =========================
 def forecast_random_forest(
     y_train: pd.Series,
@@ -422,6 +476,8 @@ def forecast_random_forest(
     random_state: int = 42,
     max_depth: int | None = None,
     min_samples_leaf: int = 2,
+    max_features: str | float | None = "sqrt",
+    bootstrap: bool = True,
 ) -> ForecastResult:
     def _factory():
         return RandomForestRegressor(
@@ -429,8 +485,16 @@ def forecast_random_forest(
             random_state=random_state,
             max_depth=max_depth,
             min_samples_leaf=min_samples_leaf,
-            n_jobs=-1,
+            max_features=max_features,
+            bootstrap=bootstrap,
+            n_jobs=1,   # <- clave: evitar explosión de hilos
         )
+
+    _mvprint(
+        "[forecast_random_forest] "
+        f"h={h} | lags={lags} | n_estimators={n_estimators} | max_depth={max_depth} | "
+        f"min_samples_leaf={min_samples_leaf} | max_features={max_features} | bootstrap={bootstrap}"
+    )
 
     yhat = _recursive_forecast_ml(_factory(), y_train, h=h, lags=lags, add_calendar=add_calendar)
     fitted = _one_step_ahead_fitted_ml(_factory, y_train, lags=lags, add_calendar=add_calendar, initial_train=12)
@@ -439,7 +503,15 @@ def forecast_random_forest(
         "random_forest",
         yhat,
         fitted=fitted,
-        details={"lags": lags, "add_calendar": add_calendar, "n_estimators": n_estimators},
+        details={
+            "lags": lags,
+            "add_calendar": add_calendar,
+            "n_estimators": n_estimators,
+            "max_depth": max_depth,
+            "min_samples_leaf": min_samples_leaf,
+            "max_features": max_features,
+            "bootstrap": bootstrap,
+        },
     )
 
 
@@ -454,6 +526,7 @@ def forecast_xgboost(
     max_depth: int = 4,
     subsample: float = 0.9,
     colsample_bytree: float = 0.9,
+    min_child_weight: float = 1.0,
 ) -> ForecastResult:
     if not _HAS_XGB:
         raise ImportError("xgboost no está instalado. Instala con: pip install xgboost")
@@ -465,10 +538,19 @@ def forecast_xgboost(
             max_depth=max_depth,
             subsample=subsample,
             colsample_bytree=colsample_bytree,
+            min_child_weight=min_child_weight,
             objective="reg:squarederror",
             random_state=random_state,
-            n_jobs=-1,
+            n_jobs=1,   # <- clave
+            verbosity=0,
         )
+
+    _mvprint(
+        "[forecast_xgboost] "
+        f"h={h} | lags={lags} | n_estimators={n_estimators} | learning_rate={learning_rate} | "
+        f"max_depth={max_depth} | subsample={subsample} | colsample_bytree={colsample_bytree} | "
+        f"min_child_weight={min_child_weight}"
+    )
 
     yhat = _recursive_forecast_ml(_factory(), y_train, h=h, lags=lags, add_calendar=add_calendar)
     fitted = _one_step_ahead_fitted_ml(_factory, y_train, lags=lags, add_calendar=add_calendar, initial_train=12)
@@ -483,35 +565,135 @@ def forecast_xgboost(
             "n_estimators": n_estimators,
             "learning_rate": learning_rate,
             "max_depth": max_depth,
+            "subsample": subsample,
+            "colsample_bytree": colsample_bytree,
+            "min_child_weight": min_child_weight,
         },
     )
 
 
 # =========================
-# Walk-forward evaluation
+# Walk-forward
 # =========================
 def walk_forward_mse(
     y: pd.Series,
     forecaster: Callable[[pd.Series, int], ForecastResult],
     h: int = 1,
     initial_train: int = 12,
+    model_name: str = "unknown_model",
 ) -> float:
     y = y.dropna().astype(float)
     check_min_length(y, initial_train + h)
 
     errors = []
-    for t in range(initial_train, len(y) - h + 1):
+    total_steps = len(y) - h - initial_train + 1
+    _vprint(f"[walk_forward_mse] model={model_name} | steps={total_steps}")
+
+    for k, t in enumerate(range(initial_train, len(y) - h + 1), start=1):
         y_train = y.iloc[:t]
-        y_true = y.iloc[t : t + h].values.astype(float)
+        y_true = y.iloc[t:t + h].values.astype(float)
 
         try:
+            _wvprint(f"[walk_forward_mse] model={model_name} | split={k}/{total_steps} | train_len={len(y_train)}")
             res = forecaster(y_train, h)
             y_pred = res.y_hat.values.astype(float)
-            errors.append(np.mean((y_true - y_pred) ** 2))
-        except Exception:
+            step_mse = np.mean((y_true - y_pred) ** 2)
+            errors.append(step_mse)
+        except Exception as e:
+            _vprint(
+                f"[walk_forward_mse] ERROR model={model_name} | split={k}/{total_steps} | "
+                f"train_len={len(y_train)} | {type(e).__name__}: {e}"
+            )
             return float("inf")
 
-    return float(np.mean(errors)) if errors else float("inf")
+    final_mse = float(np.mean(errors)) if errors else float("inf")
+    _vprint(f"[walk_forward_mse] model={model_name} | final_mse={final_mse:.6f}")
+    return final_mse
+
+
+def tune_ml_model_walk_forward(
+    y: pd.Series,
+    model_type: str,
+    param_grid: dict,
+    initial_train: int = 12,
+    h: int = 1,
+    lags: int = 12,
+    add_calendar: bool = True,
+) -> Tuple[dict, float]:
+    y = y.dropna().astype(float)
+    check_min_length(y, initial_train + h)
+
+    if not param_grid:
+        return {}, float("inf")
+
+    keys = list(param_grid.keys())
+    combos = list(product(*param_grid.values()))
+    best_score = float("inf")
+    best_params = {}
+
+    _tvprint(
+        f"[tune_ml_model_walk_forward] model_type={model_type} | combos={len(combos)} | "
+        f"initial_train={initial_train} | h={h} | lags={lags}"
+    )
+
+    for i, values in enumerate(combos, start=1):
+        params = dict(zip(keys, values))
+        _tvprint(f"[tune_ml_model_walk_forward] model_type={model_type} | combo={i}/{len(combos)} | params={params}")
+
+        try:
+            if model_type == "rf":
+                fn = lambda yt, hh, p=params: forecast_random_forest(
+                    yt,
+                    h=hh,
+                    lags=lags,
+                    add_calendar=add_calendar,
+                    **p,
+                )
+                model_name = "random_forest_tuning"
+            elif model_type == "xgb":
+                if not _HAS_XGB:
+                    continue
+                fn = lambda yt, hh, p=params: forecast_xgboost(
+                    yt,
+                    h=hh,
+                    lags=lags,
+                    add_calendar=add_calendar,
+                    **p,
+                )
+                model_name = "xgboost_tuning"
+            else:
+                raise ValueError(f"model_type no soportado: {model_type}")
+
+            mse = walk_forward_mse(
+                y,
+                fn,
+                h=h,
+                initial_train=initial_train,
+                model_name=model_name,
+            )
+
+            _tvprint(f"[tune_ml_model_walk_forward] model_type={model_type} | combo={i}/{len(combos)} | mse={mse:.6f}")
+
+            if np.isfinite(mse) and mse < best_score:
+                best_score = mse
+                best_params = params.copy()
+                _tvprint(
+                    f"[tune_ml_model_walk_forward] NUEVO MEJOR -> model_type={model_type} | "
+                    f"best_score={best_score:.6f} | best_params={best_params}"
+                )
+
+        except Exception as e:
+            _tvprint(
+                f"[tune_ml_model_walk_forward] ERROR model_type={model_type} | params={params} | "
+                f"{type(e).__name__}: {e}"
+            )
+            continue
+
+    _tvprint(
+        f"[tune_ml_model_walk_forward] FIN model_type={model_type} | "
+        f"best_score={best_score:.6f} | best_params={best_params}"
+    )
+    return best_params, best_score
 
 
 def evaluate_models(
@@ -524,14 +706,20 @@ def evaluate_models(
     seasonal_candidates: Tuple[int, ...] = (12, 6),
     seasonal_threshold: float = 0.30,
     seasonal_min_cycles: int = 2,
-    # ML
     ml_lags: int = 12,
     ml_add_calendar: bool = True,
-    ml_min_obs: int = 18,  # guardrail: no usar ML si hay muy poca historia
+    ml_min_obs: int = 18,
+    ml_tuning: bool = False,
+    rf_param_grid: Optional[dict] = None,
+    xgb_param_grid: Optional[dict] = None,
 ) -> Tuple[pd.DataFrame, Dict[str, float | bool | int]]:
-    """Evalúa modelos y retorna ranking (model,mse) + info estacionalidad."""
     y = y.dropna().astype(float)
     check_min_length(y, initial_train + h)
+
+    _vprint(
+        f"[evaluate_models] len_y={len(y)} | initial_train={initial_train} | h={h} | "
+        f"ml_lags={ml_lags} | ml_min_obs={ml_min_obs} | ml_tuning={ml_tuning}"
+    )
 
     s_info = detect_best_seasonality(
         y,
@@ -548,7 +736,6 @@ def evaluate_models(
 
     models: List[Tuple[str, Callable[[pd.Series, int], ForecastResult]]] = []
 
-    # --- clásicos no estacionales
     models.append(("simple_average", lambda yt, hh: forecast_simple_average(yt, hh)))
     models.append(("moving_average", lambda yt, hh: forecast_moving_average(yt, hh, window=ma_window)))
     models.append(("ses", lambda yt, hh: forecast_ses(yt, hh)))
@@ -561,25 +748,146 @@ def evaluate_models(
     if INCLUDE_ARIMA:
         models.append(("arima", lambda yt, hh: forecast_arima(yt, hh, order=arima_order)))
 
-    # --- ML (con guardrail)
-    if INCLUDE_ML and len(y) >= ml_min_obs:
-        models.append(("random_forest", lambda yt, hh: forecast_random_forest(yt, hh, lags=ml_lags, add_calendar=ml_add_calendar)))
-        if INCLUDE_XGBOOST and _HAS_XGB:
-            models.append(("xgboost", lambda yt, hh: forecast_xgboost(yt, hh, lags=ml_lags, add_calendar=ml_add_calendar)))
+    best_rf_params = {}
+    best_xgb_params = {}
 
-    # --- estacionales (solo si detecta estacionalidad)
+    if INCLUDE_ML and len(y) >= ml_min_obs:
+        _vprint("[evaluate_models] ML habilitado para esta serie")
+
+        if ml_tuning:
+            rf_grid = rf_param_grid or RF_PARAM_GRID
+            best_rf_params, _ = tune_ml_model_walk_forward(
+                y=y,
+                model_type="rf",
+                param_grid=rf_grid,
+                initial_train=initial_train,
+                h=h,
+                lags=ml_lags,
+                add_calendar=ml_add_calendar,
+            )
+
+            if not best_rf_params:
+                best_rf_params = {
+                    "n_estimators": 200,
+                    "random_state": 42,
+                    "max_depth": 6,
+                    "min_samples_leaf": 1,
+                    "max_features": "sqrt",
+                    "bootstrap": True,
+                }
+            else:
+                best_rf_params = {
+                    **best_rf_params,
+                    "random_state": 42,
+                }
+
+            _vprint(f"[evaluate_models] best_rf_params={best_rf_params}")
+
+            models.append((
+                "random_forest",
+                lambda yt, hh, params=best_rf_params: forecast_random_forest(
+                    yt,
+                    hh,
+                    lags=ml_lags,
+                    add_calendar=ml_add_calendar,
+                    **params,
+                )
+            ))
+
+            if INCLUDE_XGBOOST and _HAS_XGB:
+                xgb_grid = xgb_param_grid or XGB_PARAM_GRID
+                best_xgb_params, _ = tune_ml_model_walk_forward(
+                    y=y,
+                    model_type="xgb",
+                    param_grid=xgb_grid,
+                    initial_train=initial_train,
+                    h=h,
+                    lags=ml_lags,
+                    add_calendar=ml_add_calendar,
+                )
+
+                if not best_xgb_params:
+                    best_xgb_params = {
+                        "random_state": 42,
+                        "n_estimators": 400,
+                        "learning_rate": 0.05,
+                        "max_depth": 3,
+                        "subsample": 0.8,
+                        "colsample_bytree": 0.8,
+                        "min_child_weight": 1.0,
+                    }
+                else:
+                    best_xgb_params = {
+                        **best_xgb_params,
+                        "random_state": 42,
+                    }
+
+                _vprint(f"[evaluate_models] best_xgb_params={best_xgb_params}")
+
+                models.append((
+                    "xgboost",
+                    lambda yt, hh, params=best_xgb_params: forecast_xgboost(
+                        yt,
+                        hh,
+                        lags=ml_lags,
+                        add_calendar=ml_add_calendar,
+                        **params,
+                    )
+                ))
+        else:
+            models.append((
+                "random_forest",
+                lambda yt, hh: forecast_random_forest(
+                    yt,
+                    hh,
+                    lags=ml_lags,
+                    add_calendar=ml_add_calendar,
+                )
+            ))
+
+            if INCLUDE_XGBOOST and _HAS_XGB:
+                models.append((
+                    "xgboost",
+                    lambda yt, hh: forecast_xgboost(
+                        yt,
+                        hh,
+                        lags=ml_lags,
+                        add_calendar=ml_add_calendar,
+                    )
+                ))
+    else:
+        _vprint("[evaluate_models] ML NO habilitado para esta serie")
+
     if is_seasonal:
+        _vprint(f"[evaluate_models] Modelos estacionales habilitados con s={s}")
         if INCLUDE_SEASONAL_NAIVE:
             models.append(("seasonal_naive", lambda yt, hh: forecast_seasonal_naive(yt, hh, season_length=s)))
         models.append(("holt_winters", lambda yt, hh: forecast_holt_winters(yt, hh, season_length=s)))
         models.append(("sarima", lambda yt, hh: forecast_sarima(yt, hh, order=sarima_order, seasonal_order=(0, 1, 1, s))))
 
     rows = []
-    for name, fn in models:
-        mse = walk_forward_mse(y, fn, h=h, initial_train=initial_train)
-        rows.append({"model": name, "mse": mse})
+    total_models = len(models)
+    _vprint(f"[evaluate_models] Total modelos a evaluar: {total_models}")
+
+    for i, (name, fn) in enumerate(models, start=1):
+        _vprint(f"[evaluate_models] Evaluando modelo {i}/{total_models}: {name}")
+        mse = walk_forward_mse(y, fn, h=h, initial_train=initial_train, model_name=name)
+
+        params_used = None
+        if name == "random_forest" and best_rf_params:
+            params_used = best_rf_params
+        elif name == "xgboost" and best_xgb_params:
+            params_used = best_xgb_params
+
+        rows.append({
+            "model": name,
+            "mse": mse,
+            "best_params": params_used,
+        })
 
     out = pd.DataFrame(rows).sort_values("mse", ascending=True).reset_index(drop=True)
+    _vprint("[evaluate_models] Ranking final:")
+    _vprint(out.to_string(index=False))
     return out, s_info
 
 
@@ -591,20 +899,23 @@ def fit_best_and_forecast(
     ma_window: int = 3,
     arima_order: Tuple[int, int, int] = (1, 1, 1),
     sarima_order: Tuple[int, int, int] = (1, 1, 1),
-    # ML
     ml_lags: int = 12,
     ml_add_calendar: bool = True,
 ) -> ForecastResult:
-    """Ajusta el mejor modelo según ranking y pronostica h pasos."""
     y = y.dropna().astype(float)
     if y.empty:
         raise ValueError("Serie vacía.")
 
     best = str(ranking.iloc[0]["model"])
+    best_params = ranking.iloc[0].get("best_params", None)
+    if best_params is None or (isinstance(best_params, float) and pd.isna(best_params)):
+        best_params = {}
+
     s = int(seasonality_info.get("seasonal_period", 12))
     is_seasonal = bool(seasonality_info.get("is_seasonal", False))
 
-    # clásicos
+    _vprint(f"[fit_best_and_forecast] best={best} | best_params={best_params}")
+
     if best == "simple_average":
         return forecast_simple_average(y, h)
     if best == "moving_average":
@@ -636,21 +947,36 @@ def fit_best_and_forecast(
             return forecast_arima(y, h, order=arima_order)
         return forecast_sarima(y, h, order=sarima_order, seasonal_order=(0, 1, 1, s))
 
-    # ML
     if best == "random_forest":
-        return forecast_random_forest(y, h, lags=ml_lags, add_calendar=ml_add_calendar)
+        return forecast_random_forest(
+            y,
+            h,
+            lags=ml_lags,
+            add_calendar=ml_add_calendar,
+            **best_params,
+        )
 
     if best == "xgboost":
         if not _HAS_XGB:
-            # fallback robusto
-            return forecast_random_forest(y, h, lags=ml_lags, add_calendar=ml_add_calendar)
-        return forecast_xgboost(y, h, lags=ml_lags, add_calendar=ml_add_calendar)
+            return forecast_random_forest(
+                y,
+                h,
+                lags=ml_lags,
+                add_calendar=ml_add_calendar,
+            )
+        return forecast_xgboost(
+            y,
+            h,
+            lags=ml_lags,
+            add_calendar=ml_add_calendar,
+            **best_params,
+        )
 
     raise ValueError(f"Modelo desconocido: {best}")
 
 
 # =========================
-# Bandas LL/UL por cuantiles de residuales
+# Bandas por residuales
 # =========================
 def residual_quantile_bands(
     y: pd.Series,
@@ -660,22 +986,15 @@ def residual_quantile_bands(
     ma_window: int = 3,
     arima_order: Tuple[int, int, int] = (1, 1, 1),
     sarima_order: Tuple[int, int, int] = (1, 1, 1),
-    # ML
     ml_lags: int = 12,
     ml_add_calendar: bool = True,
 ) -> Dict[str, float]:
-    """
-    Cuantiles de residuales (e_t = y_t - fitted_t) para construir bandas:
-      LL_t = yhat_t + Q_alpha(e)
-      UL_t = yhat_t + Q_{1-alpha}(e)
-    """
     y = y.dropna().astype(float)
     s = int(seasonality_info.get("seasonal_period", 12))
     is_seasonal = bool(seasonality_info.get("is_seasonal", False))
 
     fitted = None
 
-    # clásicos
     if model_name == "simple_average":
         fitted = y.expanding().mean().shift(1)
 
@@ -745,39 +1064,43 @@ def residual_quantile_bands(
             ).fit(disp=False)
         fitted = pd.Series(fit.fittedvalues, index=y.index)
 
-    # ML (one-step ahead)
     elif model_name == "random_forest":
         def _rf_factory():
             return RandomForestRegressor(
-                n_estimators=400,
+                n_estimators=200,
                 random_state=42,
                 min_samples_leaf=2,
-                n_jobs=-1,
+                max_features="sqrt",
+                bootstrap=True,
+                n_jobs=1,
             )
         fitted = _one_step_ahead_fitted_ml(_rf_factory, y, lags=ml_lags, add_calendar=ml_add_calendar, initial_train=12)
 
     elif model_name == "xgboost":
         if not _HAS_XGB:
-            # fallback a RF
             def _rf_factory():
                 return RandomForestRegressor(
-                    n_estimators=400,
+                    n_estimators=200,
                     random_state=42,
                     min_samples_leaf=2,
-                    n_jobs=-1,
+                    max_features="sqrt",
+                    bootstrap=True,
+                    n_jobs=1,
                 )
             fitted = _one_step_ahead_fitted_ml(_rf_factory, y, lags=ml_lags, add_calendar=ml_add_calendar, initial_train=12)
         else:
             def _xgb_factory():
                 return XGBRegressor(
-                    n_estimators=700,
+                    n_estimators=400,
                     learning_rate=0.05,
-                    max_depth=4,
-                    subsample=0.9,
-                    colsample_bytree=0.9,
+                    max_depth=3,
+                    subsample=0.8,
+                    colsample_bytree=0.8,
+                    min_child_weight=1.0,
                     objective="reg:squarederror",
                     random_state=42,
-                    n_jobs=-1,
+                    n_jobs=1,
+                    verbosity=0,
                 )
             fitted = _one_step_ahead_fitted_ml(_xgb_factory, y, lags=ml_lags, add_calendar=ml_add_calendar, initial_train=12)
 
@@ -788,16 +1111,17 @@ def residual_quantile_bands(
     if e.empty:
         return {"q_low": 0.0, "q_high": 0.0}
 
-    # Solo meses activos (y_t > 0) si hay suficiente
     e_active = e[y.loc[e.index] > 0]
     min_active = 8
     e_use = e_active if len(e_active) >= min_active else e
 
-    return {"q_low": float(e_use.quantile(alpha)), "q_high": float(e_use.quantile(1 - alpha))}
+    out = {"q_low": float(e_use.quantile(alpha)), "q_high": float(e_use.quantile(1 - alpha))}
+    _vprint(f"[residual_quantile_bands] model={model_name} | q_low={out['q_low']:.6f} | q_high={out['q_high']:.6f}")
+    return out
 
 
 # =========================
-# Fitted + residuales para Monte Carlo (encaje B)
+# Fitted + residuales
 # =========================
 def get_fitted_and_residuals(
     y: pd.Series,
@@ -806,14 +1130,9 @@ def get_fitted_and_residuals(
     ma_window: int = 3,
     arima_order: Tuple[int, int, int] = (1, 1, 1),
     sarima_order: Tuple[int, int, int] = (1, 1, 1),
-    # ML
     ml_lags: int = 12,
     ml_add_calendar: bool = True,
 ):
-    """
-    Devuelve fitted in-sample (o one-step ahead en ML) y residuales (y - fitted).
-    Debe ser consistente con residual_quantile_bands().
-    """
     y = y.asfreq("MS").fillna(0.0).astype(float)
     name = (model_name or "").lower().strip()
 
@@ -897,10 +1216,12 @@ def get_fitted_and_residuals(
     elif name == "random_forest":
         def _rf_factory():
             return RandomForestRegressor(
-                n_estimators=400,
+                n_estimators=200,
                 random_state=42,
                 min_samples_leaf=2,
-                n_jobs=-1,
+                max_features="sqrt",
+                bootstrap=True,
+                n_jobs=1,
             )
         fitted = _one_step_ahead_fitted_ml(_rf_factory, y, lags=ml_lags, add_calendar=ml_add_calendar, initial_train=12)
 
@@ -908,29 +1229,33 @@ def get_fitted_and_residuals(
         if not _HAS_XGB:
             def _rf_factory():
                 return RandomForestRegressor(
-                    n_estimators=400,
+                    n_estimators=200,
                     random_state=42,
                     min_samples_leaf=2,
-                    n_jobs=-1,
+                    max_features="sqrt",
+                    bootstrap=True,
+                    n_jobs=1,
                 )
             fitted = _one_step_ahead_fitted_ml(_rf_factory, y, lags=ml_lags, add_calendar=ml_add_calendar, initial_train=12)
         else:
             def _xgb_factory():
                 return XGBRegressor(
-                    n_estimators=700,
+                    n_estimators=400,
                     learning_rate=0.05,
-                    max_depth=4,
-                    subsample=0.9,
-                    colsample_bytree=0.9,
+                    max_depth=3,
+                    subsample=0.8,
+                    colsample_bytree=0.8,
+                    min_child_weight=1.0,
                     objective="reg:squarederror",
                     random_state=42,
-                    n_jobs=-1,
+                    n_jobs=1,
+                    verbosity=0,
                 )
             fitted = _one_step_ahead_fitted_ml(_xgb_factory, y, lags=ml_lags, add_calendar=ml_add_calendar, initial_train=12)
 
     else:
-        # fallback seguro
         fitted = y.shift(1)
 
     resid = (y - fitted).dropna()
+    _vprint(f"[get_fitted_and_residuals] model={name} | resid_len={len(resid)}")
     return fitted, resid
