@@ -194,6 +194,7 @@ def get_eda_prod_vs_fact(scope: str):
 
 def get_eda_late_summary(scope: str, min_delay: int = 2):
     df = _ensure_types(_read_silver())
+    print("Suma VAL TOTAL al leer Silver:", df["VAL TOTAL"].sum())
     df_scope, titulo = _filter_scope(df, scope)
 
     total_mes = (
